@@ -1,81 +1,183 @@
-name: Construir y publicar imagen dockers
+name: Terraform + Docker CI/CD
+
 on:
   push:
     branches:
       - main
       - dev
+
 jobs:
-  bulid-and-push:
+  # 🧱 1. Crear infraestructura en OCI con Terraform
+  terraform:
+    name: Provisionar infraestructura (Terraform)
     runs-on: ubuntu-latest
+
+    outputs:
+      vm_ip: ${{ steps.get_ip.outputs.vm_ip }}   # ✅ Salida con la IP pública
+
     steps:
-      - name: Checkout repositorys
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.7.5
+
+      - name: Crear archivo de llave privada OCI
+        run: |
+          mkdir -p ~/.oci
+          echo "$OCI_PRIVATE_KEY" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+        env:
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+
+      - name: Inicializar Terraform
+        run: terraform -chdir=terraform init
+        env:
+          TF_VAR_tenancy_ocid: ${{ secrets.OCI_TENANCY_OCID }}
+          TF_VAR_user_ocid: ${{ secrets.OCI_USER_OCID }}
+          TF_VAR_fingerprint: ${{ secrets.OCI_FINGERPRINT }}
+          TF_VAR_private_key_path: "/home/runner/.oci/oci_api_key.pem"
+          TF_VAR_region: ${{ secrets.OCI_REGION }}
+          TF_VAR_compartment_ocid: ${{ secrets.OCI_COMPARTMENT_OCID }}
+          TF_VAR_subnet_id: ${{ secrets.OCI_SUBNET_ID }}
+          TF_VAR_availability_domain: ${{ secrets.OCI_AVAILABILITY_DOMAIN }}
+          TF_VAR_ssh_public_key: ${{ secrets.SSH_PUBLIC_KEY }}
+
+      - name: Validar y Planificar Terraform
+        working-directory: ./terraform
+        run: |
+          terraform fmt -recursive
+          terraform validate
+          terraform plan -out=tfplan
+        env:
+          TF_VAR_tenancy_ocid: ${{ secrets.OCI_TENANCY_OCID }}
+          TF_VAR_user_ocid: ${{ secrets.OCI_USER_OCID }}
+          TF_VAR_fingerprint: ${{ secrets.OCI_FINGERPRINT }}
+          TF_VAR_private_key_path: "/home/runner/.oci/oci_api_key.pem"
+          TF_VAR_region: ${{ secrets.OCI_REGION }}
+          TF_VAR_compartment_ocid: ${{ secrets.OCI_COMPARTMENT_OCID }}
+          TF_VAR_subnet_id: ${{ secrets.OCI_SUBNET_ID }}
+          TF_VAR_availability_domain: ${{ secrets.OCI_AVAILABILITY_DOMAIN }}
+          TF_VAR_ssh_public_key: ${{ secrets.SSH_PUBLIC_KEY }}
+
+      - name: Aplicar Terraform (solo en main)
+        if: github.ref == 'refs/heads/main'
+        working-directory: ./terraform
+        run: terraform apply -auto-approve tfplan
+        env:
+          TF_VAR_tenancy_ocid: ${{ secrets.OCI_TENANCY_OCID }}
+          TF_VAR_user_ocid: ${{ secrets.OCI_USER_OCID }}
+          TF_VAR_fingerprint: ${{ secrets.OCI_FINGERPRINT }}
+          TF_VAR_private_key_path: "/home/runner/.oci/oci_api_key.pem"
+          TF_VAR_region: ${{ secrets.OCI_REGION }}
+          TF_VAR_compartment_ocid: ${{ secrets.OCI_COMPARTMENT_OCID }}
+          TF_VAR_subnet_id: ${{ secrets.OCI_SUBNET_ID }}
+          TF_VAR_availability_domain: ${{ secrets.OCI_AVAILABILITY_DOMAIN }}
+          TF_VAR_ssh_public_key: ${{ secrets.SSH_PUBLIC_KEY }}
+
+      - name: Obtener IP pública de la VM
+        id: get_ip
+        working-directory: ./terraform
+        run: |
+          ip=$(terraform output -raw public_ip)
+          echo "vm_ip=$ip" >> $GITHUB_OUTPUT
+          echo "✅ IP pública obtenida: $ip"
+
+  # 🐳 2. Construir y publicar la imagen Docker
+  build-and-push:
+    name: Construir y publicar imagen Docker
+    runs-on: ubuntu-latest
+    needs: terraform   # ✅ Espera a que la VM esté creada
+
+    steps:
+      - name: Checkout repository
         uses: actions/checkout@v5
-      - name: login a Docker hubs
+
+      - name: Login a Docker Hub
         uses: docker/login-action@v3
         with:
-          username: ${{secrets.DOCKER_USER}}
-          password: ${{secrets.DOCKER_PASSWORD}}
-      - name: Construir la imagen dockers
-        run: docker build -t ${{secrets.DOCKER_USER}}/frontend:latest .
-      - name: Publicar imagen dockers
-        run: docker push ${{secrets.DOCKER_USER}}/frontend:latest
+          username: ${{ secrets.DOCKER_USER }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Construir imagen Docker
+        run: docker build -t ${{ secrets.DOCKER_USER }}/frontend:latest .
+
+      - name: Publicar imagen Docker
+        run: docker push ${{ secrets.DOCKER_USER }}/frontend:latest
+
+  # 🚀 3. Desplegar la app en la VM creada
   deploy:
-    needs: bulid-and-push
+    name: Desplegar app en VM
     runs-on: ubuntu-latest
-
-
+    needs: [terraform, build-and-push]   # ✅ Espera a Terraform y Docker
     steps:
-      - name: Chekcout del codigo (Obtener docker compose.yml, setup_vm.sh)
+      - name: Checkout del código
         uses: actions/checkout@v5
-      
-      #1. configurar acceso SSH
-      - name: configurar agente SSH
+
+      - name: Configurar agente SSH
         uses: webfactory/ssh-agent@v0.9.0
         with:
-          ssh-private-key: ${{secrets.SSH_PRIVATE_KEY}}
-      #2. Copiar scrip de la configuracion a la VM
-      - name: Copiar script de la conf a la VM
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Copiar script de configuración a la VM
         uses: appleboy/scp-action@v0.1.3
-        with: 
-          host: ${{secrets.SSH_HOST}}
-          username: ${{secrets.SSH_USER}}
-          key: ${{secrets.SSH_PRIVATE_KEY}}
+        with:
+          host: ${{ needs.terraform.outputs.vm_ip }}     # ✅ IP dinámica
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
           source: setup_vm.sh
           target: /tmp/
-      # 3. ejecutar script  de confiracion en la VM
-      - name: Ejecutar el script de instalacion en la VM
+
+      - name: Ejecutar script en la VM
         uses: appleboy/ssh-action@master
         with:
-          host: ${{secrets.SSH_HOST}}
-          username: ${{secrets.SSH_USER}}
-          key: ${{secrets.SSH_PRIVATE_KEY}}
+          host: ${{ needs.terraform.outputs.vm_ip }}     # ✅ IP dinámica
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
             chmod +x /tmp/setup_vm.sh
-            /tmp/setup_vm.sh ${{secrets.SSH_USER}}
+            /tmp/setup_vm.sh ${{ secrets.SSH_USER }}
             rm /tmp/setup_vm.sh
-      # 4. copiamos el docker-compose VM
-      - name: copiamos el docker-compose VM
+
+      - name: Copiar docker-compose a la VM
         uses: appleboy/scp-action@v0.1.3
         with:
-          host: ${{secrets.SSH_HOST}}
-          username: ${{secrets.SSH_USER}}
-          key: ${{secrets.SSH_PRIVATE_KEY}}
+          host: ${{ needs.terraform.outputs.vm_ip }}     # ✅ IP dinámica
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
           source: docker-compose.yml
-          target: "/home/${{secrets.SSH_USER}}/deploy/"
-      # 5. ejecutar docker-compose
-      - name: ejecutar el docker compose
+          target: "/home/${{ secrets.SSH_USER }}/deploy/"
+
+      - name: Ejecutar docker-compose en la VM
         uses: appleboy/ssh-action@master
         with:
-          host: ${{secrets.SSH_HOST}}
-          username: ${{secrets.SSH_USER}}
-          key: ${{secrets.SSH_PRIVATE_KEY}}
+          host: ${{ needs.terraform.outputs.vm_ip }}     # ✅ IP dinámica
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
-            DEPLOY_PATH="/home/${{secrets.SSH_USER}}/deploy"
+            DEPLOY_PATH="/home/${{ secrets.SSH_USER }}/deploy"
             cd $DEPLOY_PATH
 
-            sudo docker-compose down
-
-            echo ${{secrets.SSH_USER}} | sudo docker login -u ${{secrets.DOCKER_USER}} --password-stdin
+            sudo docker-compose down || true
+            echo ${{ secrets.DOCKER_PASSWORD }} | sudo docker login -u ${{ secrets.DOCKER_USER }} --password-stdin
             sudo docker-compose pull
             sudo docker-compose up -d --force-recreate
             sudo docker logout
+  notify:
+    name: Notificar por correo
+    runs-on: ubuntu-latest
+    needs: deploy
+    steps:
+      - name: Notificar éxito o fallo
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.EMAIL_USER }}
+          password: ${{ secrets.EMAIL_PASS }}
+          subject: ${{ needs.deploy.result == 'success' && '✅ Despliegue exitoso' || '❌ Error en despliegue' }}
+          body: ${{ needs.deploy.result == 'success' && 'El despliegue se completó correctamente.' || 'Hubo un error en el despliegue.' }}
+          to: destinatario@correo.com
+          from: ${{ secrets.EMAIL_USER }}
