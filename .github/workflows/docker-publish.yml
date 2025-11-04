@@ -1,0 +1,81 @@
+name: Construir y publicar imagen dockers
+on:
+  push:
+    branches:
+      - main
+      - dev
+jobs:
+  bulid-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repositorys
+        uses: actions/checkout@v5
+      - name: login a Docker hubs
+        uses: docker/login-action@v3
+        with:
+          username: ${{secrets.DOCKER_USER}}
+          password: ${{secrets.DOCKER_PASSWORD}}
+      - name: Construir la imagen dockers
+        run: docker build -t ${{secrets.DOCKER_USER}}/frontend:latest .
+      - name: Publicar imagen dockers
+        run: docker push ${{secrets.DOCKER_USER}}/frontend:latest
+  deploy:
+    needs: bulid-and-push
+    runs-on: ubuntu-latest
+
+
+    steps:
+      - name: Chekcout del codigo (Obtener docker compose.yml, setup_vm.sh)
+        uses: actions/checkout@v5
+      
+      #1. configurar acceso SSH
+      - name: configurar agente SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{secrets.SSH_PRIVATE_KEY}}
+      #2. Copiar scrip de la configuracion a la VM
+      - name: Copiar script de la conf a la VM
+        uses: appleboy/scp-action@v0.1.3
+        with: 
+          host: ${{secrets.SSH_HOST}}
+          username: ${{secrets.SSH_USER}}
+          key: ${{secrets.SSH_PRIVATE_KEY}}
+          source: setup_vm.sh
+          target: /tmp/
+      # 3. ejecutar script  de confiracion en la VM
+      - name: Ejecutar el script de instalacion en la VM
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{secrets.SSH_HOST}}
+          username: ${{secrets.SSH_USER}}
+          key: ${{secrets.SSH_PRIVATE_KEY}}
+          script: |
+            chmod +x /tmp/setup_vm.sh
+            /tmp/setup_vm.sh ${{secrets.SSH_USER}}
+            rm /tmp/setup_vm.sh
+      # 4. copiamos el docker-compose VM
+      - name: copiamos el docker-compose VM
+        uses: appleboy/scp-action@v0.1.3
+        with:
+          host: ${{secrets.SSH_HOST}}
+          username: ${{secrets.SSH_USER}}
+          key: ${{secrets.SSH_PRIVATE_KEY}}
+          source: docker-compose.yml
+          target: "/home/${{secrets.SSH_USER}}/deploy/"
+      # 5. ejecutar docker-compose
+      - name: ejecutar el docker compose
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{secrets.SSH_HOST}}
+          username: ${{secrets.SSH_USER}}
+          key: ${{secrets.SSH_PRIVATE_KEY}}
+          script: |
+            DEPLOY_PATH="/home/${{secrets.SSH_USER}}/deploy"
+            cd $DEPLOY_PATH
+
+            sudo docker-compose down
+
+            echo ${{secrets.SSH_USER}} | sudo docker login -u ${{secrets.DOCKER_USER}} --password-stdin
+            sudo docker-compose pull
+            sudo docker-compose up -d --force-recreate
+            sudo docker logout
